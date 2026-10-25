@@ -1,7 +1,7 @@
+import base64
+import json
 import re
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -9,21 +9,28 @@ from google import genai
 from google.genai import types
 from streamlit_mic_recorder import speech_to_text
 
+try:
+    from supabase import create_client
+except ImportError:  # app still works in guest mode
+    create_client = None
+
 
 # =========================================================
-# CONFIGURATION (unchanged)
+# CONFIGURATION
 # =========================================================
 
 st.set_page_config(
-    page_title="BCA Study Assist",
+    page_title="AI Study Assistant",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
-DB_PATH = "study_assist.db"
-MODEL = "gemini-3.5-flash-lite"
+MODEL = "gemini-3.5-flash-lite"  # unchanged
 MAX_MESSAGE_CHARS = 12000
+GUEST_LIMIT = 3
+MIN_PASSWORD = 8
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 BCA_SCOPE = """
 You are BCA Study Assist, a friendly AI tutor specialized in BCA
@@ -66,243 +73,160 @@ question first if essential information is missing. Include breaks, practice, an
 revision. Put '☐ Not done' in the Status column.
 """
 
-TOOL_STEP = "Step-by-step problem solving"
-TOOL_SCHEDULE = "Personalized study schedule"
-TOOL_NOTES = "Voice transcription → notes"
-TOOLS = [TOOL_STEP, TOOL_SCHEDULE, TOOL_NOTES]
+STEP_INSTRUCTION = """
+Focus on step-by-step problem solving for BCA subjects. Use numbered steps,
+explain why each step works, and include a small example when useful.
+"""
+
+QUIZ_INSTRUCTION = """
+Create a short BCA quiz on the requested topic (5 questions unless the student
+asks for another number). Use multiple-choice questions with options A-D.
+Put all correct answers with one-line explanations in an 'Answer key' section
+at the very end, after all the questions.
+"""
+
 THEMES = ["Light", "Dark", "System"]
 
 
 # =========================================================
-# SQLITE DATABASE
-# Existing chats/messages are preserved; nothing is deleted or recreated.
-# The only addition is a small `app_settings` table (CREATE IF NOT EXISTS)
-# used to remember the appearance choice.
+# SUPABASE CLIENT (one client per browser session, never shared)
 # =========================================================
 
-@contextmanager
-def db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
+def _secret(*names):
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _key_is_service_role(key):
+    """Refuse powerful keys: they bypass Row Level Security."""
+    if key.startswith("sb_secret_"):
+        return True
     try:
-        yield con
-        con.commit()
+        payload = key.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role") == "service_role"
     except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+        return False
 
 
-def table_columns(con, table_name):
-    return {row["name"] for row in con.execute(f"PRAGMA table_info({table_name})")}
+def get_sb():
+    if "sb" not in st.session_state:
+        if create_client is None:
+            raise ValueError("The 'supabase' package is not installed. Add it to requirements.txt.")
+        url = _secret("SUPABASE_URL")
+        key = _secret("SUPABASE_KEY", "SUPABASE_ANON_KEY")
+        if not url or not key:
+            raise ValueError("SUPABASE_URL or SUPABASE_KEY is missing in secrets.")
+        if _key_is_service_role(key):
+            raise ValueError("Use the anon/publishable Supabase key, not the service_role/secret key.")
+        st.session_state.sb = create_client(url, key)
+    return st.session_state.sb
 
 
-def init_db():
-    with db() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS chats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-        """)
-
-        cols = table_columns(con, "chats")
-        if "title" not in cols:
-            con.execute("ALTER TABLE chats ADD COLUMN title TEXT")
-        if "created_at" not in cols:
-            con.execute("ALTER TABLE chats ADD COLUMN created_at TEXT")
-        if "updated_at" not in cols:
-            con.execute("ALTER TABLE chats ADD COLUMN updated_at TEXT")
-
-        now = datetime.now().isoformat(timespec="seconds")
-        con.execute("UPDATE chats SET title = 'Previous chat' WHERE title IS NULL")
-        con.execute("UPDATE chats SET created_at = ? WHERE created_at IS NULL", (now,))
-        con.execute("UPDATE chats SET updated_at = created_at WHERE updated_at IS NULL")
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(chat_id) REFERENCES chats(id)
-            )
-        """)
-
-        msg_cols = table_columns(con, "messages")
-        if "chat_id" not in msg_cols:
-            con.execute("ALTER TABLE messages ADD COLUMN chat_id INTEGER")
-        if "role" not in msg_cols:
-            con.execute("ALTER TABLE messages ADD COLUMN role TEXT")
-        if "content" not in msg_cols:
-            con.execute("ALTER TABLE messages ADD COLUMN content TEXT")
-        if "created_at" not in msg_cols:
-            con.execute("ALTER TABLE messages ADD COLUMN created_at TEXT")
-        con.execute(
-            "UPDATE messages SET created_at = ? WHERE created_at IS NULL",
-            (now,),
-        )
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS study_plans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                subjects TEXT NOT NULL,
-                plan TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        plan_cols = table_columns(con, "study_plans")
-        if "chat_id" not in plan_cols:
-            con.execute("ALTER TABLE study_plans ADD COLUMN chat_id INTEGER")
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS timetable_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                day TEXT,
-                time_slot TEXT,
-                subject TEXT,
-                task TEXT NOT NULL,
-                goal TEXT,
-                status INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(chat_id) REFERENCES chats(id)
-            )
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS lecture_notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filename TEXT NOT NULL,
-                transcript TEXT NOT NULL,
-                notes TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        # New, additive: tiny key/value table for the appearance preference.
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        con.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chat ON timetable_tasks(chat_id, id)")
-
-
-def get_setting(key, default=""):
+def auth_client():
     try:
-        with db() as con:
-            row = con.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row and row["value"] is not None else default
+        return get_sb(), ""
+    except Exception as error:
+        return None, str(error)
+
+
+def sb_table(name):
+    return get_sb().table(name)
+
+
+def iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe(fn, *args, default=None):
+    """Run a database read; on failure remember the problem and return a default."""
+    try:
+        return fn(*args)
     except Exception:
+        st.session_state.db_error = True
         return default
 
 
-def set_setting(key, value):
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
-    except Exception:
-        pass  # Preference persistence is best-effort.
+# =========================================================
+# DATABASE (Supabase, protected by RLS: every row belongs to auth.uid())
+# =========================================================
 
-
-def create_chat():
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO chats (title, created_at, updated_at) VALUES (?, ?, ?)",
-            ("New chat", now, now),
-        )
-        return cur.lastrowid
+def make_title(text):
+    clean = " ".join(text.split())
+    return (clean[:42] + ("..." if len(clean) > 42 else "")) or "New chat"
 
 
 def list_chats():
-    """Saved conversations (those that have at least one message), newest first."""
-    with db() as con:
-        return con.execute(
-            """SELECT c.id, c.title, c.updated_at FROM chats c
-               WHERE EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id)
-               ORDER BY c.updated_at DESC, c.id DESC"""
-        ).fetchall()
+    res = (sb_table("bca_chats").select("id,title,updated_at")
+           .order("updated_at", desc=True).limit(200).execute())
+    return res.data or []
 
 
-def _like_pattern(text):
+def _like(text):
     t = text.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{t}%"
 
 
 def search_chats(query, limit=40):
-    """Search by title and by message contents. Returns rows with a `hit` snippet source."""
-    if not query.strip():
-        return []
-    pat = _like_pattern(query)
-    with db() as con:
-        return con.execute(
-            """SELECT c.id, c.title, c.updated_at,
-                      (SELECT m.content FROM messages m
-                        WHERE m.chat_id = c.id AND m.content LIKE ? ESCAPE '\\'
-                        ORDER BY m.id LIMIT 1) AS hit
-               FROM chats c
-               WHERE EXISTS (SELECT 1 FROM messages m0 WHERE m0.chat_id = c.id)
-                 AND (c.title LIKE ? ESCAPE '\\'
-                      OR EXISTS (SELECT 1 FROM messages m
-                                  WHERE m.chat_id = c.id AND m.content LIKE ? ESCAPE '\\'))
-               ORDER BY c.updated_at DESC, c.id DESC LIMIT ?""",
-            (pat, pat, pat, limit),
-        ).fetchall()
+    pat = _like(query)
+    found = (sb_table("bca_chats").select("id,title,updated_at")
+             .ilike("title", pat).limit(limit).execute().data or [])
+    hits = sb_table("bca_messages").select("chat_id").ilike("content", pat).limit(200).execute().data or []
+    extra_ids = {r["chat_id"] for r in hits} - {r["id"] for r in found}
+    if extra_ids:
+        found += (sb_table("bca_chats").select("id,title,updated_at")
+                  .in_("id", list(extra_ids)).execute().data or [])
+    found.sort(key=lambda r: r["updated_at"], reverse=True)
+    return found[:limit]
 
 
 def get_messages(chat_id):
-    with db() as con:
-        return con.execute(
-            "SELECT id, role, content, created_at FROM messages WHERE chat_id = ? ORDER BY id",
-            (chat_id,),
-        ).fetchall()
+    res = (sb_table("bca_messages").select("id,role,content,created_at")
+           .eq("chat_id", chat_id).order("id").execute())
+    return res.data or []
 
 
-def save_message(chat_id, role, content):
-    now = datetime.now().isoformat(timespec="seconds")
-    clean_title = " ".join(content.split())
-    with db() as con:
-        con.execute(
-            "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, role, content, now),
-        )
-        if role == "user":
-            row = con.execute("SELECT title FROM chats WHERE id = ?", (chat_id,)).fetchone()
-            if row and (row["title"] or "") in ("", "New chat", "Previous chat"):
-                title = clean_title[:42] + ("..." if len(clean_title) > 42 else "")
-                con.execute("UPDATE chats SET title = ? WHERE id = ?", (title or "New chat", chat_id))
-        con.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
+def create_chat(user_id, title):
+    res = sb_table("bca_chats").insert({"user_id": user_id, "title": title}).execute()
+    return res.data[0]["id"]
 
 
 def delete_chat(chat_id):
-    with db() as con:
-        con.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        con.execute("DELETE FROM timetable_tasks WHERE chat_id = ?", (chat_id,))
-        con.execute("DELETE FROM study_plans WHERE chat_id = ?", (chat_id,))
-        con.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    # messages and timetable tasks are removed by ON DELETE CASCADE
+    sb_table("bca_chats").delete().eq("id", chat_id).execute()
 
 
-def save_plan(chat_id, subjects, plan):
-    with db() as con:
-        con.execute(
-            "INSERT INTO study_plans (chat_id, subjects, plan, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, subjects, plan, datetime.now().isoformat(timespec="seconds")),
-        )
+def clear_history(user_id):
+    sb_table("bca_chats").delete().eq("user_id", user_id).execute()
+
+
+def persist_exchange(chat_id, user_id, prompt, answer):
+    """Save question + answer together (one insert, so no half-saved or duplicate rows)."""
+    created_here = False
+    if chat_id is None:
+        chat_id = create_chat(user_id, make_title(prompt))
+        created_here = True
+    try:
+        sb_table("bca_messages").insert([
+            {"chat_id": chat_id, "user_id": user_id, "role": "user", "content": prompt},
+            {"chat_id": chat_id, "user_id": user_id, "role": "assistant", "content": answer},
+        ]).execute()
+        if not created_here:
+            sb_table("bca_chats").update({"updated_at": iso_now()}).eq("id", chat_id).execute()
+    except Exception:
+        if created_here:
+            try:
+                delete_chat(chat_id)  # don't leave an empty chat behind
+            except Exception:
+                pass
+        raise
+    return chat_id
 
 
 def parse_markdown_table(text):
@@ -354,38 +278,27 @@ def parse_markdown_table(text):
     return tasks
 
 
-def replace_chat_tasks(chat_id, tasks):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as con:
-        con.execute("DELETE FROM timetable_tasks WHERE chat_id = ?", (chat_id,))
-        for item in tasks:
-            con.execute(
-                """INSERT INTO timetable_tasks
-                   (chat_id, day, time_slot, subject, task, goal, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
-                (chat_id, item["day"], item["time_slot"], item["subject"],
-                 item["task"], item["goal"], now),
-            )
+def replace_chat_tasks(chat_id, user_id, tasks):
+    sb_table("bca_timetable_tasks").delete().eq("chat_id", chat_id).execute()
+    rows = [{"chat_id": chat_id, "user_id": user_id, "day": t["day"], "time_slot": t["time_slot"],
+             "subject": t["subject"], "task": t["task"], "goal": t["goal"], "status": False}
+            for t in tasks]
+    if rows:
+        sb_table("bca_timetable_tasks").insert(rows).execute()
 
 
 def get_tasks(chat_id):
-    with db() as con:
-        return con.execute(
-            "SELECT * FROM timetable_tasks WHERE chat_id = ? ORDER BY id",
-            (chat_id,),
-        ).fetchall()
+    res = (sb_table("bca_timetable_tasks").select("*")
+           .eq("chat_id", chat_id).order("id").execute())
+    return res.data or []
 
 
 def set_task_status(task_id, status):
-    with db() as con:
-        con.execute("UPDATE timetable_tasks SET status = ? WHERE id = ?", (int(status), task_id))
-
-
-init_db()
+    sb_table("bca_timetable_tasks").update({"status": bool(status)}).eq("id", task_id).execute()
 
 
 # =========================================================
-# HISTORY GROUPING + SEARCH HELPERS
+# HISTORY GROUPING HELPERS
 # =========================================================
 
 GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Older"]
@@ -393,7 +306,7 @@ GROUP_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Old
 
 def chat_group(updated_at):
     try:
-        d = datetime.fromisoformat(updated_at).date()
+        d = datetime.fromisoformat(str(updated_at)[:19]).date()
     except Exception:
         return "Older"
     days = (date.today() - d).days
@@ -418,16 +331,6 @@ def group_chats(rows):
 def short_title(title, limit=28):
     title = " ".join((title or "Previous chat").split())
     return title if len(title) <= limit else title[:limit].rstrip() + "..."
-
-
-def make_snippet(text, query, width=70):
-    flat = " ".join((text or "").split())
-    idx = flat.lower().find(query.strip().lower())
-    if idx < 0:
-        return flat[:width * 2]
-    start = max(0, idx - width // 2)
-    end = min(len(flat), idx + len(query) + width)
-    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
 # =========================================================
@@ -485,9 +388,11 @@ def friendly_error(error):
     return "Something went wrong while generating the answer. Your message was not lost; please try again."
 
 
+# ---- Natural-language routing: the user just types what they need ----
+
 def looks_like_timetable(prompt):
     p = prompt.lower()
-    return any(word in p for word in (
+    return any(w in p for w in (
         "timetable", "study plan", "study schedule", "revision plan",
         "study planner", "time table", "schedule my study",
     ))
@@ -495,77 +400,221 @@ def looks_like_timetable(prompt):
 
 def looks_like_notes(prompt):
     p = prompt.lower()
-    return any(word in p for word in (
+    return any(w in p for w in (
         "summarize this lecture", "summarise this lecture", "make notes from",
         "lecture notes", "summarize this transcript", "summarise this transcript",
+        "notes from this", "transcript",
     ))
 
 
-def build_request(tool, prompt):
-    """Return (prompt_for_ai, extra_instruction, wants_timetable) for the selected tool."""
-    if tool == TOOL_STEP:
-        prompt_for_ai = (
-            "Solve this BCA study question step by step. Explain each step in "
-            "beginner-friendly language, show working/code and expected output "
-            "when relevant, and stay focused on the problem.\n\n" + prompt
-        )
-        extra = (
-            "Focus only on step-by-step problem solving for BCA subjects. "
-            "Use numbered steps, explain why each step works, and include a "
-            "small example when useful."
-        )
-    elif tool == TOOL_SCHEDULE:
-        prompt_for_ai = (
+def looks_like_quiz(prompt):
+    p = prompt.lower()
+    return any(w in p for w in (
+        "quiz", "mcq", "multiple choice", "test me", "practice questions", "practice test",
+    ))
+
+
+def looks_like_steps(prompt):
+    p = prompt.lower()
+    return any(w in p for w in (
+        "step by step", "step-by-step", "solve", "dry run", "trace the", "find the output",
+        "how to calculate", "work out",
+    ))
+
+
+def build_request(prompt):
+    """Return (prompt_for_ai, extra_instruction, wants_timetable)."""
+    if looks_like_timetable(prompt):
+        return (
             "Create or refine a personalized study schedule based on this request. "
             "If essential details such as available hours, subjects, or deadline "
-            "are missing, ask a short follow-up question instead of guessing.\n\n" + prompt
+            "are missing, ask a short follow-up question instead of guessing.\n\n" + prompt,
+            TABLE_INSTRUCTION, True,
         )
-        extra = (
-            "Generate a realistic personalized study schedule. Use a Markdown "
-            "table with Day/Date, Time, Subject, Task, Goal, and Status. Include "
-            "breaks, practice, and revision. Use '☐ Not done' for Status."
+    if looks_like_notes(prompt):
+        return (
+            "Turn the following content into clear BCA study notes. Preserve the "
+            "meaning; organize it with headings, definitions, key points, examples "
+            "only when supported, and a short revision summary. Do not invent "
+            "missing facts.\n\n" + prompt,
+            NOTES_INSTRUCTION, False,
         )
-    else:
-        prompt_for_ai = (
-            "Turn the following spoken/transcribed content into clear BCA study "
-            "notes. Preserve the meaning; organize it with headings, definitions, "
-            "key points, examples only when supported, and a short revision summary. "
-            "Do not invent missing facts. If the text is not lecture/study content, "
-            "ask the user to record or provide study-related content.\n\n" + prompt
+    if looks_like_quiz(prompt):
+        return prompt, QUIZ_INSTRUCTION, False
+    if looks_like_steps(prompt):
+        return (
+            "Solve this BCA study question step by step. Explain each step in "
+            "beginner-friendly language, show working/code and expected output "
+            "when relevant.\n\n" + prompt,
+            STEP_INSTRUCTION, False,
         )
-        extra = NOTES_INSTRUCTION
-
-    wants_timetable = tool == TOOL_SCHEDULE or looks_like_timetable(prompt)
-    if wants_timetable:
-        extra += "\n" + TABLE_INSTRUCTION
-    elif tool != TOOL_NOTES and looks_like_notes(prompt):
-        extra += "\n\n" + NOTES_INSTRUCTION
-    return prompt_for_ai, extra, wants_timetable
+    return prompt, "", False
 
 
 # =========================================================
 # SESSION STATE (all keys initialised once, up front)
 # =========================================================
 
-if "theme" not in st.session_state:
-    saved_theme = get_setting("theme", "System")
-    st.session_state.theme = saved_theme if saved_theme in THEMES else "System"
-if "appearance_choice" not in st.session_state:
-    st.session_state.appearance_choice = st.session_state.theme
-if "chat_id" not in st.session_state:
-    # None = a fresh, unsaved chat. A row is only created when the first
-    # message is successfully answered, so no empty chats pile up.
+def init_state():
+    defaults = {
+        "theme": "System",
+        "user": None,            # {"id": ..., "email": ...} when signed in
+        "chat_id": None,         # None = fresh chat; a row is created on first saved answer
+        "delete_target": None,
+        "clear_pending": False,
+        "composer_text": "",
+        "last_mic_text": "",
+        "guest_count": 0,
+        "guest_messages": [],    # guest chats live only in this session
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if "appearance_choice" not in st.session_state:
+        st.session_state.appearance_choice = st.session_state.theme
+
+
+init_state()
+
+# A theme loaded at sign-in must be applied BEFORE the radio widget exists.
+_pending_theme = st.session_state.pop("pending_theme", None)
+if _pending_theme in THEMES:
+    st.session_state.theme = _pending_theme
+    st.session_state.appearance_choice = _pending_theme
+
+
+# =========================================================
+# AUTHENTICATION
+# =========================================================
+
+def clear_auth_state():
+    st.session_state.user = None
     st.session_state.chat_id = None
-if "delete_target" not in st.session_state:
     st.session_state.delete_target = None
-if "show_search" not in st.session_state:
-    st.session_state.show_search = False
-if "composer_text" not in st.session_state:
-    st.session_state.composer_text = ""
-if "last_mic_text" not in st.session_state:
-    st.session_state.last_mic_text = ""
-if "selected_study_tool" not in st.session_state:
-    st.session_state.selected_study_tool = TOOL_STEP
+    st.session_state.clear_pending = False
+    st.session_state.pop("sb", None)  # drop this session's client and its tokens
+
+
+def current_user():
+    """Signed-in user, or None. Also refreshes an expiring token."""
+    user = st.session_state.get("user")
+    if not user:
+        return None
+    try:
+        session = st.session_state.sb.auth.get_session()
+    except Exception:
+        session = None
+    if session is None:
+        clear_auth_state()
+        return None
+    return user
+
+
+def set_user(sb_user):
+    st.session_state.user = {"id": str(sb_user.id), "email": sb_user.email or ""}
+    st.session_state.chat_id = None
+    st.session_state.guest_messages = []
+    meta = getattr(sb_user, "user_metadata", None) or {}
+    if meta.get("theme") in THEMES:
+        st.session_state.pending_theme = meta["theme"]
+
+
+def sign_in(email, password):
+    res = get_sb().auth.sign_in_with_password({"email": email, "password": password})
+    set_user(res.user)
+
+
+def sign_up(email, password):
+    res = get_sb().auth.sign_up({"email": email, "password": password})
+    if res.session and res.user:  # email confirmation is turned off in Supabase
+        set_user(res.user)
+        return "signed_in"
+    if res.user is not None and getattr(res.user, "identities", None) == []:
+        return "exists"
+    return "verify"       # confirmation email sent
+
+
+def sign_out():
+    try:
+        st.session_state.sb.auth.sign_out()
+    except Exception:
+        pass
+    clear_auth_state()
+
+
+def friendly_auth_error(error):
+    low = (getattr(error, "message", None) or str(error)).lower()
+    if "invalid login" in low or "invalid credentials" in low:
+        return "Incorrect email or password."
+    if "not confirmed" in low:
+        return "Please verify your email first. Check your inbox for the confirmation link."
+    if "already registered" in low or "already been registered" in low:
+        return "An account with this email already exists. Try signing in."
+    if "rate limit" in low or "too many" in low or "429" in low:
+        return "Too many attempts. Please wait a few minutes and try again."
+    if "password" in low and any(k in low for k in ("least", "weak", "short", "characters")):
+        return "That password is too weak. Use at least 8 characters."
+    if any(k in low for k in ("timeout", "timed out", "connection", "network", "getaddrinfo", "unreachable")):
+        return "Couldn't reach the server. Please check your internet connection."
+    return "Couldn't complete that. Please try again."
+
+
+def render_auth_forms(prefix):
+    sb, problem = auth_client()
+    if sb is None:
+        st.warning("Accounts are unavailable right now. You can keep using guest mode.")
+        if problem:
+            st.caption(problem)
+        return
+    tab_in, tab_up = st.tabs(["Sign in", "Sign up"])
+
+    with tab_in:
+        with st.form(f"{prefix}_signin_form", border=False):
+            email = st.text_input("Email", key=f"{prefix}_si_email")
+            password = st.text_input("Password", type="password", key=f"{prefix}_si_pw")
+            go = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if go:
+            email = email.strip().lower()
+            if not EMAIL_RE.match(email) or not password:
+                st.error("Enter a valid email and your password.")
+            else:
+                ok = False
+                try:
+                    with st.spinner("Signing in..."):
+                        sign_in(email, password)
+                    ok = True
+                except Exception as error:
+                    st.error(friendly_auth_error(error))
+                if ok:
+                    st.rerun()
+
+    with tab_up:
+        with st.form(f"{prefix}_signup_form", border=False):
+            email = st.text_input("Email", key=f"{prefix}_su_email")
+            password = st.text_input("Password (min 8 characters)", type="password", key=f"{prefix}_su_pw")
+            confirm = st.text_input("Confirm password", type="password", key=f"{prefix}_su_pw2")
+            go = st.form_submit_button("Create account", type="primary", use_container_width=True)
+        if go:
+            email = email.strip().lower()
+            if not EMAIL_RE.match(email):
+                st.error("Enter a valid email address.")
+            elif len(password) < MIN_PASSWORD:
+                st.error(f"Password must be at least {MIN_PASSWORD} characters.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            else:
+                status = None
+                try:
+                    with st.spinner("Creating your account..."):
+                        status = sign_up(email, password)
+                except Exception as error:
+                    st.error(friendly_auth_error(error))
+                if status == "signed_in":
+                    st.rerun()
+                elif status == "verify":
+                    st.success("Account created! Check your email for a verification link, then sign in.")
+                elif status == "exists":
+                    st.info("An account with this email already exists. Try signing in.")
 
 
 # =========================================================
@@ -588,136 +637,144 @@ def _vars(palette):
     return " ".join(f"--{k}: {v};" for k, v in palette.items())
 
 
+# NOTE: no blank lines inside this <style> block (Markdown would split the HTML there).
 CSS_TEMPLATE = """
 <style>
 /*ROOT*/
-
 html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
 [data-testid="stMainBlockContainer"], [data-testid="stBottom"],
-[data-testid="stBottomBlockContainer"] {
-    background: var(--app-bg) !important;
-    color: var(--text) !important;
+[data-testid="stBottomBlockContainer"], [data-testid="stHeader"] {
+    background: var(--app-bg) !important; color: var(--text) !important;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
-
-/* Hide Streamlit chrome (the header stays so the sidebar toggle keeps working) */
-#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"],
+.stApp :is(p, li, h1, h2, h3, h4, h5, h6, label, summary, span, td, th) { color: var(--text); }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+#MainMenu, footer, [data-testid="stToolbarActions"], [data-testid="stMainMenu"], [data-testid="stDecoration"],
 [data-testid="stAppDeployButton"], .stDeployButton { display: none !important; visibility: hidden !important; }
+[data-testid="stToolbar"] { background: transparent !important; }
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] { display: flex !important; visibility: visible !important; opacity: 1 !important; }
 [data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stHeader"] button, [data-testid="stHeader"] svg,
+[data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapseButton"] svg {
+    color: var(--text) !important; fill: var(--text) !important;
+}
 [data-testid="InputInstructions"] { display: none !important; }
-
-.block-container { max-width: 820px; padding-top: 1.5rem; padding-bottom: 1.5rem; }
-
-/* Sidebar */
-[data-testid="stSidebar"] { background: var(--panel-bg) !important; border-right: 1px solid var(--border); }
-[data-testid="stSidebar"] * { color: var(--text); }
-[data-testid="stSidebar"] .brand { font-weight: 700; font-size: 1.05rem; margin: .2rem 0 .8rem; }
-[data-testid="stSidebar"] .group-label {
-    color: var(--muted) !important; font-size: .74rem; font-weight: 600;
-    margin: 1rem 0 .25rem .3rem; letter-spacing: .02em;
-}
-[data-testid="stSidebar"] div.stButton > button {
-    border: none; background: transparent; box-shadow: none;
-    justify-content: flex-start; text-align: left; border-radius: 10px;
-    min-height: 38px; padding: .3rem .6rem; font-weight: 400;
-}
-[data-testid="stSidebar"] div.stButton > button:hover { background: var(--hover); }
-[data-testid="stSidebar"] button[kind="primary"] {
-    background: var(--button-bg) !important; color: var(--button-text) !important; font-weight: 600;
-}
-[data-testid="stSidebar"] button[kind="primary"] * { color: var(--button-text) !important; }
-[data-testid="stSidebar"] [data-testid="stExpander"] { border: 1px solid var(--border); border-radius: 12px; }
-
-/* Greeting / empty state */
-.greeting-wrap { text-align: center; margin: 14vh 0 4vh; }
-.greeting { font-size: 2rem; font-weight: 650; letter-spacing: -0.5px; color: var(--text); }
+.block-container { max-width: 820px; padding-top: 3.2rem; padding-bottom: 1.5rem; }
+/* Three-line menu button (falls back to Streamlit's default arrow on versions with other test ids) */
+[data-testid="stExpandSidebarButton"] svg, [data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"],
+[data-testid="stSidebarCollapsedControl"] svg, [data-testid="collapsedControl"] svg { display: none !important; }
+[data-testid="stExpandSidebarButton"]::before, [data-testid="stSidebarCollapsedControl"] button::before,
+[data-testid="collapsedControl"] button::before { content: "☰"; font-size: 1.45rem; line-height: 1; color: var(--text); }
+/* Title and greeting */
+.app-title { text-align: center; font-size: 1.35rem; font-weight: 650; letter-spacing: -0.3px; color: var(--text); margin: 0 0 .6rem; }
+.greeting-wrap { text-align: center; margin: 10vh 0 4vh; }
+.greeting { font-size: 1.9rem; font-weight: 650; letter-spacing: -0.5px; color: var(--text); }
 .greeting-sub { color: var(--muted); margin-top: .5rem; font-size: .98rem; }
-
-/* Messages */
-[data-testid="stChatMessage"] {
-    background: transparent; border: none; padding: .5rem .2rem; margin-bottom: .4rem;
+/* Sidebar */
+[data-testid="stSidebar"], [data-testid="stSidebar"] > div { background: var(--panel-bg) !important; }
+[data-testid="stSidebar"] { border-right: 1px solid var(--border); }
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .25rem !important; align-items: center; }
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div { min-width: 0 !important; }
+[data-testid="stSidebar"] button[kind="secondary"], [data-testid="stSidebar"] [data-testid="stBaseButton-secondary"] {
+    border: none !important; background: transparent !important; box-shadow: none !important;
+    justify-content: flex-start; text-align: left; border-radius: 10px; min-height: 38px; padding: .3rem .6rem;
 }
+[data-testid="stSidebar"] button[kind="secondary"]:hover, [data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]:hover {
+    background: var(--hover) !important;
+}
+/* Tabs (History / Settings / Profile and Sign in / Sign up) */
+[data-baseweb="tab-list"] { background: transparent !important; }
+button[data-baseweb="tab"] { background: transparent !important; }
+button[data-baseweb="tab"] * { color: var(--muted) !important; }
+button[data-baseweb="tab"][aria-selected="true"] * { color: var(--text) !important; }
+[data-baseweb="tab-highlight"] { background: var(--text) !important; }
+[data-baseweb="tab-border"] { background: var(--border) !important; }
+/* Messages */
+[data-testid="stChatMessage"] { background: transparent; border: none; padding: .5rem .2rem; margin-bottom: .4rem; }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
     background: var(--hover); border-radius: 18px; padding: .7rem 1rem;
 }
-[data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] p,
-[data-testid="stCaptionContainer"] { color: var(--text); }
-[data-testid="stCaptionContainer"] { color: var(--muted); }
-pre, code { border-radius: 10px; }
-
-/* Generic inputs and buttons */
+pre, code, [data-testid="stCode"] pre { border-radius: 10px; background: var(--panel-bg) !important; color: var(--text) !important; }
+[data-testid="stMarkdownContainer"] table { border-collapse: collapse; }
+[data-testid="stMarkdownContainer"] th, [data-testid="stMarkdownContainer"] td {
+    border: 1px solid var(--border) !important; padding: .35rem .6rem; color: var(--text) !important;
+}
+[data-testid="stMarkdownContainer"] th { background: var(--panel-bg) !important; }
+/* Inputs */
 input, textarea, [data-baseweb="select"] > div { border-color: var(--border) !important; }
-[data-testid="stTextInput"] input, [data-baseweb="input"] input, textarea {
-    background-color: var(--surface) !important; color: var(--text) !important;
-    -webkit-text-fill-color: var(--text) !important;
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"], [data-baseweb="textarea"] > div,
+[data-baseweb="input"] > div { background: var(--surface) !important; border-color: var(--border) !important; }
+input, textarea { background-color: var(--surface) !important; color: var(--text) !important; -webkit-text-fill-color: var(--text) !important; }
+input::placeholder, textarea::placeholder { color: var(--muted) !important; -webkit-text-fill-color: var(--muted) !important; opacity: 1; }
+[data-baseweb="input"] svg { fill: var(--muted) !important; }
+/* Buttons */
+button[kind="secondary"], button[kind="secondaryFormSubmit"],
+[data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-secondaryFormSubmit"] {
+    border: 1px solid var(--border) !important; border-radius: 12px; min-height: 40px;
+    background: var(--surface) !important; color: var(--text) !important;
 }
-[data-baseweb="input"] > div, [data-baseweb="textarea"] > div {
-    background: var(--surface) !important; border-color: var(--border) !important;
+button[kind="secondary"]:hover, [data-testid="stBaseButton-secondary"]:hover { border-color: var(--text) !important; background: var(--hover) !important; }
+button[kind="primary"], button[kind="primaryFormSubmit"],
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {
+    background: var(--button-bg) !important; color: var(--button-text) !important; border: none !important;
+    border-radius: 12px; min-height: 40px; font-weight: 600;
 }
-div.stButton > button {
-    border: 1px solid var(--border); border-radius: 12px; min-height: 40px;
-    background: var(--surface); color: var(--text);
-}
-div.stButton > button:hover { border-color: var(--text); background: var(--hover); color: var(--text); }
-div[data-testid="stRadio"] label, div[data-testid="stCheckbox"] label { color: var(--text) !important; }
-[data-testid="stDialog"] > div, div[role="dialog"] { background: var(--app-bg) !important; color: var(--text) !important; }
+button[kind="primary"] *, button[kind="primaryFormSubmit"] *,
+[data-testid="stBaseButton-primary"] *, [data-testid="stBaseButton-primaryFormSubmit"] * { color: var(--button-text) !important; }
+/* Alerts, expanders, menus, toasts */
+[data-testid="stAlert"] { background: var(--panel-bg) !important; border: 1px solid var(--border); }
+[data-testid="stAlert"] * { color: var(--text) !important; }
+[data-testid="stExpander"] { border: 1px solid var(--border) !important; border-radius: 12px; background: var(--surface); }
+[data-baseweb="popover"] > div, [data-baseweb="menu"], ul[role="listbox"] { background: var(--surface) !important; color: var(--text) !important; }
+[data-testid="stToast"] { background: var(--surface) !important; color: var(--text) !important; border: 1px solid var(--border); }
 hr { border-color: var(--border) !important; }
-
-/* ChatGPT-style composer: one rounded pill, pinned to the bottom */
-[data-testid="stHorizontalBlock"]:has(.composer-anchor) {
+/* Composer: one rounded pill pinned to the bottom (scoped so other forms are unaffected) */
+@CMP@ {
     position: sticky; bottom: 12px; z-index: 50;
     background: var(--surface); border: 1px solid var(--border); border-radius: 30px;
     padding: 6px 8px 6px 16px; gap: .25rem !important;
     align-items: flex-end; flex-wrap: nowrap !important; margin-top: 1rem;
     box-shadow: 0 0 0 14px var(--app-bg);
 }
-[data-testid="stHorizontalBlock"]:has(.composer-anchor) > div { min-width: 0 !important; }
-[data-testid="stHorizontalBlock"]:has(.composer-anchor) > div:first-child { flex: 1 1 auto !important; }
-[data-testid="stHorizontalBlock"]:has(.composer-anchor) > div:last-child {
-    flex: 0 0 auto !important; width: auto !important; min-width: 48px !important;
-}
+@CMP@ > div { min-width: 0 !important; }
+@CMP@ > div:first-child { flex: 1 1 auto !important; }
+@CMP@ > div:last-child { flex: 0 0 auto !important; width: auto !important; min-width: 48px !important; }
 .element-container:has(.composer-anchor) { display: none; }
 [data-testid="stForm"] { border: none !important; padding: 0 !important; background: transparent !important; }
-[data-testid="stForm"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: flex-end; gap: .4rem !important; }
-[data-testid="stForm"] [data-testid="stHorizontalBlock"] > div { min-width: 0 !important; }
-[data-testid="stForm"] [data-testid="stHorizontalBlock"] > div:first-child { flex: 1 1 auto !important; }
-[data-testid="stForm"] [data-testid="stHorizontalBlock"] > div:last-child {
-    flex: 0 0 44px !important; width: 44px !important; min-width: 44px !important;
-}
-[data-testid="stForm"] textarea { border: none !important; box-shadow: none !important; background: transparent !important; }
-[data-testid="stForm"] [data-baseweb="textarea"], [data-testid="stForm"] [data-baseweb="textarea"] > div,
-[data-testid="stForm"] [data-baseweb="base-input"] {
-    border: none !important; background: transparent !important; box-shadow: none !important;
-}
-[data-testid="stFormSubmitButton"] button {
+@CMP@ [data-testid="stForm"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: flex-end; gap: .4rem !important; }
+@CMP@ [data-testid="stForm"] [data-testid="stHorizontalBlock"] > div { min-width: 0 !important; }
+@CMP@ [data-testid="stForm"] [data-testid="stHorizontalBlock"] > div:first-child { flex: 1 1 auto !important; }
+@CMP@ [data-testid="stForm"] [data-testid="stHorizontalBlock"] > div:last-child { flex: 0 0 44px !important; width: 44px !important; min-width: 44px !important; }
+@CMP@ [data-testid="stForm"] textarea { border: none !important; box-shadow: none !important; background: transparent !important; }
+@CMP@ [data-testid="stForm"] [data-baseweb="textarea"], @CMP@ [data-testid="stForm"] [data-baseweb="textarea"] > div,
+@CMP@ [data-testid="stForm"] [data-baseweb="base-input"] { border: none !important; background: transparent !important; box-shadow: none !important; }
+@CMP@ [data-testid="stFormSubmitButton"] button {
     width: 40px; height: 40px; min-height: 40px; padding: 0; border-radius: 50% !important;
     font-size: 1.25rem; line-height: 1; justify-content: center;
-    background: var(--button-bg) !important; color: var(--button-text) !important;
-    border: none !important;
+    background: var(--button-bg) !important; color: var(--button-text) !important; border: none !important;
 }
-[data-testid="stFormSubmitButton"] button * { color: var(--button-text) !important; }
-
+@CMP@ [data-testid="stFormSubmitButton"] button * { color: var(--button-text) !important; }
 @media (max-width: 700px) {
-    .block-container { padding: 1rem .8rem 1rem; }
+    .block-container { padding: 3rem .8rem 1rem; }
     .greeting { font-size: 1.6rem; }
-    .greeting-wrap { margin-top: 8vh; }
-    [data-testid="stHorizontalBlock"]:has(.composer-anchor) { padding-left: 12px; }
+    .greeting-wrap { margin-top: 6vh; }
+    @CMP@ { padding-left: 12px; }
 }
 </style>
 """
 
 
 def apply_theme(theme):
-    """Light/Dark are explicit. System follows the browser/OS via prefers-color-scheme."""
+    """Light/Dark are explicit. System follows the OS via prefers-color-scheme."""
     base = DARK if theme == "Dark" else LIGHT
     root = f":root {{ color-scheme: {'dark' if theme == 'Dark' else 'light'}; {_vars(base)} }}"
     if theme == "System":
         root += f" @media (prefers-color-scheme: dark) {{ :root {{ color-scheme: dark; {_vars(DARK)} }} }}"
-    st.markdown(CSS_TEMPLATE.replace("/*ROOT*/", root), unsafe_allow_html=True)
+    css = CSS_TEMPLATE.replace("@CMP@", '[data-testid="stHorizontalBlock"]:has(.composer-anchor)')
+    st.markdown(css.replace("/*ROOT*/", root), unsafe_allow_html=True)
 
 
-# Enter sends, Shift+Enter inserts a newline (desktop only). Works by turning a plain
-# Enter into the Ctrl+Enter that Streamlit already uses to submit a form.
+# Enter sends, Shift+Enter inserts a newline (desktop only).
 ENTER_TO_SEND_JS = """
 <script>
 (function () {
@@ -741,6 +798,7 @@ ENTER_TO_SEND_JS = """
 </script>
 """
 
+user = current_user()
 apply_theme(st.session_state.theme)
 
 
@@ -751,19 +809,21 @@ apply_theme(st.session_state.theme)
 def open_chat(chat_id):
     st.session_state.chat_id = chat_id
     st.session_state.delete_target = None
-    st.session_state.show_search = False
+    st.session_state.clear_pending = False
 
 
 def start_new_chat():
-    # Does not touch the database: the old chat stays saved, the new one is
-    # created only when its first message is answered.
+    # Nothing is written to the database: a chat row is created only when
+    # its first answer is saved. Guest counter is NOT reset.
     st.session_state.chat_id = None
+    st.session_state.guest_messages = []
     st.session_state.delete_target = None
-    st.session_state.show_search = False
+    st.session_state.clear_pending = False
 
 
 def ask_delete(chat_id):
     st.session_state.delete_target = chat_id
+    st.session_state.clear_pending = False
 
 
 def cancel_delete():
@@ -773,86 +833,58 @@ def cancel_delete():
 def confirm_delete():
     target = st.session_state.delete_target
     if target is not None:
-        delete_chat(target)
+        safe(delete_chat, target)
         if st.session_state.chat_id == target:
             st.session_state.chat_id = None
     st.session_state.delete_target = None
 
 
+def ask_clear():
+    st.session_state.clear_pending = True
+    st.session_state.delete_target = None
+
+
+def cancel_clear():
+    st.session_state.clear_pending = False
+
+
+def confirm_clear():
+    u = st.session_state.get("user")
+    if u:
+        safe(clear_history, u["id"])
+    st.session_state.chat_id = None
+    st.session_state.clear_pending = False
+
+
 def on_theme_change():
     choice = st.session_state.appearance_choice
-    if choice in THEMES:
-        st.session_state.theme = choice
-        set_setting("theme", choice)
-
-
-def open_search_panel():
-    st.session_state.show_search = True
-
-
-def close_search_panel():
-    st.session_state.show_search = False
+    if choice not in THEMES:
+        return
+    st.session_state.theme = choice
+    if st.session_state.get("user") and "sb" in st.session_state:
+        try:  # saved on the account so it follows the user to any device
+            st.session_state.sb.auth.update_user({"data": {"theme": choice}})
+        except Exception:
+            pass  # preference saving is best-effort
 
 
 # =========================================================
-# SEARCH POPUP (st.dialog if available, otherwise an in-page panel)
+# SIDEBAR  (☰ opens it: History, Settings, Profile)
 # =========================================================
 
-def render_search_body():
-    query = st.text_input(
-        "Search chats",
-        placeholder="Search chats by title or message...",
-        label_visibility="collapsed",
-        key="search_query",
-    )
-    if query.strip():
-        rows = search_chats(query)
-        if not rows:
-            st.caption("No conversations found.")
-    else:
-        rows = list_chats()[:15]
-        st.caption("Recent conversations" if rows else "No conversations yet.")
+def render_history_tab(all_chats):
+    if not user:
+        st.caption("Sign in to save your conversations and find them here later. "
+                   "Guest chats are not saved.")
+        return
 
-    for row in rows:
-        if st.button(short_title(row["title"], 46), key=f"sr_{row['id']}", use_container_width=True):
-            st.session_state.chat_id = row["id"]
-            st.session_state.delete_target = None
-            st.session_state.show_search = False
-            st.rerun()
-        if query.strip() and "hit" in row.keys() and row["hit"]:
-            st.caption(make_snippet(row["hit"], query))
-
-
-_dialog_fn = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
-search_dialog = _dialog_fn("Search chats")(render_search_body) if _dialog_fn else None
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-with st.sidebar:
-    st.markdown('<div class="brand">🎓 BCA Study Assistant</div>', unsafe_allow_html=True)
-
-    st.button("＋  New chat", key="new_chat_btn", on_click=start_new_chat,
-              use_container_width=True, type="primary")
-
-    if search_dialog:
-        if st.button("🔍  Search chats", key="open_search_btn", use_container_width=True):
-            search_dialog()
-    else:
-        st.button("🔍  Search chats", key="open_search_btn", on_click=open_search_panel,
-                  use_container_width=True)
-
-    st.markdown('<div class="group-label">Study tool</div>', unsafe_allow_html=True)
-    st.radio("Choose what you want to do", TOOLS, key="selected_study_tool",
-             label_visibility="collapsed")
-
-    saved_chats = list_chats()
+    query = st.text_input("Search history", placeholder="Search history...",
+                          label_visibility="collapsed", key="history_search")
+    rows = safe(search_chats, query, default=[]) if query.strip() else all_chats
 
     if st.session_state.delete_target is not None:
         target_title = next(
-            (short_title(c["title"], 34) for c in saved_chats if c["id"] == st.session_state.delete_target),
+            (short_title(c["title"], 34) for c in all_chats if c["id"] == st.session_state.delete_target),
             "this conversation",
         )
         st.warning(f"Delete “{target_title}”? This cannot be undone.")
@@ -860,43 +892,80 @@ with st.sidebar:
         yes_col.button("Delete", key="confirm_delete_btn", on_click=confirm_delete, use_container_width=True)
         no_col.button("Cancel", key="cancel_delete_btn", on_click=cancel_delete, use_container_width=True)
 
-    if not saved_chats:
-        st.markdown('<div class="group-label">Chats</div>', unsafe_allow_html=True)
+    if not all_chats:
         st.caption("No conversations yet. Ask your first question to get started.")
-    else:
-        for group_name, group_rows in group_chats(saved_chats):
-            st.markdown(f'<div class="group-label">{group_name}</div>', unsafe_allow_html=True)
-            for chat in group_rows:
-                title_col, del_col = st.columns([6, 1], vertical_alignment="center")
-                label = ("●  " if chat["id"] == st.session_state.chat_id else "") + short_title(chat["title"])
-                title_col.button(label, key=f"chat_{chat['id']}", on_click=open_chat,
-                                 args=(chat["id"],), use_container_width=True)
-                del_col.button("🗑", key=f"del_{chat['id']}", on_click=ask_delete,
-                               args=(chat["id"],), help="Delete conversation")
+        return
+    if query.strip() and not rows:
+        st.caption("No conversations found.")
+
+    for group_name, group_rows in group_chats(rows):
+        st.caption(group_name)
+        for chat in group_rows:
+            title_col, del_col = st.columns([6, 1], vertical_alignment="center")
+            label = ("●  " if chat["id"] == st.session_state.chat_id else "") + short_title(chat["title"])
+            title_col.button(label, key=f"chat_{chat['id']}", on_click=open_chat,
+                             args=(chat["id"],), use_container_width=True)
+            del_col.button("🗑", key=f"del_{chat['id']}", on_click=ask_delete,
+                           args=(chat["id"],), help="Delete conversation")
 
     st.divider()
-    with st.expander("⚙️  Settings"):
-        st.radio(
-            "Appearance",
-            THEMES,
-            horizontal=True,
-            key="appearance_choice",
-            on_change=on_theme_change,
-        )
-        st.caption("System follows your browser/OS light or dark setting.")
-    st.caption("Gemini AI · SQLite storage")
+    if st.session_state.clear_pending:
+        st.warning("Delete ALL your conversations? This cannot be undone.")
+        yes_col, no_col = st.columns(2)
+        yes_col.button("Yes, clear all", key="confirm_clear_btn", on_click=confirm_clear, use_container_width=True)
+        no_col.button("Cancel", key="cancel_clear_btn", on_click=cancel_clear, use_container_width=True)
+    else:
+        st.button("Clear all history", key="clear_all_btn", on_click=ask_clear, use_container_width=True)
+
+
+def render_settings_tab():
+    st.radio("Appearance", THEMES, horizontal=True, key="appearance_choice", on_change=on_theme_change)
+    st.caption("System follows your device's light or dark setting.")
+    if user:
+        st.caption("Your appearance choice is saved to your account.")
+
+
+def render_profile_tab():
+    if user:
+        st.text(user["email"])
+        st.caption("Signed in. Your chats are saved privately to your account.")
+        st.button("Sign out", key="signout_btn", on_click=sign_out, use_container_width=True)
+    else:
+        left = max(GUEST_LIMIT - st.session_state.guest_count, 0)
+        st.caption(f"Guest mode · {left} of {GUEST_LIMIT} free questions left. "
+                   "Sign up or sign in to unlock everything and save your history.")
+        render_auth_forms("side")
+
+
+all_chats = safe(list_chats, default=[]) if user else []
+
+with st.sidebar:
+    st.button("＋  New chat", key="new_chat_btn", on_click=start_new_chat,
+              use_container_width=True, type="primary")
+    tab_history, tab_settings, tab_profile = st.tabs(["History", "Settings", "Profile"])
+    with tab_history:
+        render_history_tab(all_chats)
+    with tab_settings:
+        render_settings_tab()
+    with tab_profile:
+        render_profile_tab()
 
 
 # =========================================================
 # MAIN: CHAT AREA + COMPOSER
 # =========================================================
 
-chat_id = st.session_state.chat_id
-history = get_messages(chat_id) if chat_id is not None else []
-tool = st.session_state.selected_study_tool
+st.markdown('<div class="app-title">AI Study Assistant</div>', unsafe_allow_html=True)
 
-# Created first so messages render ABOVE the composer, even though the
-# composer's result is needed to decide what to render.
+chat_id = st.session_state.chat_id
+guest_locked = user is None and st.session_state.guest_count >= GUEST_LIMIT
+
+if user:
+    history = safe(get_messages, chat_id, default=[]) if chat_id is not None else []
+else:
+    history = st.session_state.guest_messages
+
+# Created first so messages render ABOVE the composer.
 chat_area = st.container()
 
 # Text to restore after a failed send, applied before the composer widget exists.
@@ -906,14 +975,13 @@ if restored:
 
 composer_cols = st.columns([12, 1], vertical_alignment="bottom")
 
-with composer_cols[1]:
-    mic_text = speech_to_text(
-        language="en",
-        start_prompt="🎙️",
-        stop_prompt="■",
-        just_once=True,
-        key="composer_mic",
-    )
+mic_text = None
+if not guest_locked:
+    with composer_cols[1]:
+        mic_text = speech_to_text(
+            language="en", start_prompt="🎙️", stop_prompt="■",
+            just_once=True, key="composer_mic",
+        )
 
 # Voice transcript only FILLS the composer. It is never submitted automatically.
 if mic_text and mic_text != st.session_state.last_mic_text:
@@ -928,19 +996,22 @@ with composer_cols[0]:
         with input_col:
             typed_prompt = st.text_area(
                 "Message",
-                placeholder="Ask a BCA question or describe your study goal...",
+                placeholder=("Sign up or sign in to continue..." if guest_locked
+                             else "Ask a BCA question or describe your study goal..."),
                 label_visibility="collapsed",
                 key="composer_text",
                 height=68,
                 max_chars=MAX_MESSAGE_CHARS,
+                disabled=guest_locked,
             )
         with send_col:
-            send_clicked = st.form_submit_button("↑", help="Send message", use_container_width=True)
+            send_clicked = st.form_submit_button("↑", help="Send message",
+                                                 use_container_width=True, disabled=guest_locked)
 
 components.html(ENTER_TO_SEND_JS, height=0)
 
 prompt = None
-if send_clicked:
+if send_clicked and not guest_locked:
     cleaned = (typed_prompt or "").strip()
     if cleaned:
         prompt = cleaned
@@ -949,48 +1020,38 @@ if send_clicked:
 
 
 def render_tracker(tracker_chat_id):
-    tasks = get_tasks(tracker_chat_id)
+    tasks = safe(get_tasks, tracker_chat_id, default=[])
     if not tasks:
         return
     st.divider()
     st.subheader("📅 Timetable goals & progress")
-    st.caption("Tick tasks as you complete them. Your progress is saved in SQLite.")
+    st.caption("Tick tasks as you complete them. Your progress is saved to your account.")
     completed = sum(1 for task in tasks if task["status"])
     st.progress(completed / len(tasks))
     st.write(f"**{completed} of {len(tasks)} tasks completed**")
-
     for task in tasks:
         label_parts = [p for p in (task["day"], task["time_slot"], task["subject"]) if p]
         label_parts.append(task["task"])
         if task["goal"]:
             label_parts.append(f"Goal: {task['goal']}")
-        checked = st.checkbox(
-            " · ".join(label_parts),
-            value=bool(task["status"]),
-            key=f"task_done_{task['id']}",
-        )
+        checked = st.checkbox(" · ".join(label_parts), value=bool(task["status"]),
+                              key=f"task_done_{task['id']}")
         if checked != bool(task["status"]):
-            set_task_status(task["id"], checked)
+            try:
+                set_task_status(task["id"], checked)
+            except Exception:
+                st.toast("Couldn't save that change. Please try again.")
             st.rerun()
 
 
-GREETING_HINTS = {
-    TOOL_STEP: "Ask a BCA or programming question and I'll explain it step by step.",
-    TOOL_SCHEDULE: "Tell me your subjects, daily study hours and exam date to get a timetable.",
-    TOOL_NOTES: "Tap the mic, speak, edit the text if needed, then press send to get notes.",
-}
-
 with chat_area:
-    # Fallback search panel for Streamlit versions without st.dialog.
-    if st.session_state.show_search and not search_dialog:
-        with st.container(border=True):
-            render_search_body()
-            st.button("Close search", key="close_search_btn", on_click=close_search_panel)
+    if st.session_state.pop("db_error", False):
+        st.warning("Couldn't reach your saved chats just now. Please check your connection and try again.")
 
     if not history and not prompt:
         st.markdown(
-            f'<div class="greeting-wrap"><div class="greeting">How can I help you?</div>'
-            f'<div class="greeting-sub">{GREETING_HINTS[tool]}</div></div>',
+            '<div class="greeting-wrap"><div class="greeting">How can I help you today?</div>'
+            '<div class="greeting-sub">Ask anything about your BCA subjects.</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -1013,9 +1074,10 @@ with chat_area:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        prompt_for_ai, extra, wants_timetable = build_request(tool, prompt)
+        prompt_for_ai, extra, wants_timetable = build_request(prompt)
         failed = False
-        with st.chat_message("assistant"):
+        assistant_box = st.chat_message("assistant")
+        with assistant_box:
             with st.spinner("Thinking..."):
                 try:
                     answer = generate_text(prompt_for_ai, history, extra)
@@ -1025,30 +1087,63 @@ with chat_area:
                     # Nothing was saved, so nothing is duplicated; give the text back.
                     st.session_state.restore_text = prompt
 
+        saved = True
         if not failed:
-            # Persist the exchange only after Gemini answered successfully.
-            if chat_id is None:
-                chat_id = create_chat()
-                st.session_state.chat_id = chat_id
-            save_message(chat_id, "user", prompt)
-            save_message(chat_id, "assistant", answer)
+            if user:
+                # Persist only after Gemini answered successfully, in a single insert.
+                try:
+                    new_id = persist_exchange(chat_id, user["id"], prompt, answer)
+                    chat_id = new_id
+                    st.session_state.chat_id = new_id
+                except Exception:
+                    saved = False
+            else:
+                st.session_state.guest_messages.append({"role": "user", "content": prompt})
+                st.session_state.guest_messages.append({"role": "assistant", "content": answer})
+                st.session_state.guest_count += 1
 
-            if wants_timetable:
-                tasks = parse_markdown_table(answer)
-                if tasks:
-                    replace_chat_tasks(chat_id, tasks)
-                    save_plan(chat_id, prompt, answer)
+            if saved and wants_timetable:
+                if user:
+                    tasks = parse_markdown_table(answer)
+                    tracked = False
+                    if tasks:
+                        try:
+                            replace_chat_tasks(chat_id, user["id"], tasks)
+                            tracked = True
+                        except Exception:
+                            pass
+                    if not tracked:
+                        st.session_state.flash = (
+                            "info",
+                            "The timetable is shown above. You can ask me to format it as a table "
+                            "to track it with checkboxes.",
+                            "",
+                        )
                 else:
                     st.session_state.flash = (
-                        "info",
-                        "The timetable is shown above. You can ask me to format it as a table "
-                        "to track it with checkboxes.",
-                        "",
+                        "info", "Sign in to track this timetable with checkboxes and keep it saved.", "",
                     )
-        st.rerun()
 
-    if chat_id is not None:
+        if saved:
+            st.rerun()
+        elif not failed:
+            # Answer was generated but could not be saved: show it so it isn't lost.
+            with assistant_box:
+                st.markdown(answer)
+            st.warning("This answer couldn't be saved to your history. Copy it if you need it, "
+                       "then check your connection.")
+
+    if guest_locked:
+        st.info(f"You've used your {GUEST_LIMIT} free guest questions. "
+                "Please sign up or sign in to keep going. It's free, and your chats will be saved.")
+        render_auth_forms("main")
+
+    if user and chat_id is not None:
         render_tracker(chat_id)
 
     if history:
+        if user is None and not guest_locked:
+            left = GUEST_LIMIT - st.session_state.guest_count
+            st.caption(f"Guest mode · {left} free question{'s' if left != 1 else ''} left. "
+                       "Sign in from the ☰ menu to save your chats.")
         st.caption("Verify important facts and exam answers with your course materials.")

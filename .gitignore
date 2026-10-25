@@ -5,3 +5,5 @@ __pycache__/
 .streamlit/secrets.toml
 study_assist.db
 .env
+
+
